@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.pipeworx-io/nhtsa",
+  "title": "Nhtsa",
+  "description": "NHTSA MCP — wraps the NHTSA vPIC (Vehicle Product Information Catalog) API (free, no auth)",
+  "version": "0.2.0",
+  "websiteUrl": "https://pipeworx.io/packs/nhtsa",
+  "repository": {
+    "url": "https://github.com/pipeworx-io/mcp-nhtsa",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://gateway.pipeworx.io/nhtsa/mcp"
+    }
+  ]
+}

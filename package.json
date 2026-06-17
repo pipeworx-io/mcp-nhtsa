@@ -1,18 +1,20 @@
 {
   "name": "@pipeworx/mcp-nhtsa",
-  "version": "0.1.0",
-  "description": "MCP server for vehicle data (VIN decoding, makes, models) via NHTSA vPIC API",
+  "version": "0.2.0",
+  "description": "NHTSA MCP — wraps the NHTSA vPIC (Vehicle Product Information Catalog) API (free, no auth)",
+  "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
-  "files": ["src"],
-  "scripts": {
-    "build": "tsc",
-    "check": "tsc --noEmit"
-  },
-  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "nhtsa", "vehicles", "vin", "automotive"],
-  "author": "Pipeworx",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "nhtsa"],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pipeworx-io/mcp-nhtsa"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
   "devDependencies": {
-    "typescript": "^5.0.0"
+    "typescript": "^5.7.0"
   }
 }
