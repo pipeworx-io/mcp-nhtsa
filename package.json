@@ -1,20 +1,32 @@
 {
   "name": "@pipeworx/mcp-nhtsa",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "NHTSA MCP — wraps the NHTSA vPIC (Vehicle Product Information Catalog) API (free, no auth)",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "bin": {
+    "mcp-nhtsa": "bin/cli.js"
+  },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "nhtsa"],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pipeworx-io/mcp-nhtsa"
+    "url": "git+https://github.com/pipeworx-io/mcp-nhtsa.git"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "tsx": "^4.19.0"
+  },
   "devDependencies": {
-    "typescript": "^5.7.0"
+    "typescript": "^5.9.3",
+    "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-65db2bf0a4af4e88671b584c574e4caf9260a322071dcc9c18f7341a2a5035c5",
+    "sourceCommit": "adb69d997f82a62e8e22b594488c7d04a227db35"
   }
 }
