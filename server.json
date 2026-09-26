@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/nhtsa",
   "title": "Nhtsa",
   "description": "NHTSA MCP — wraps the NHTSA vPIC (Vehicle Product Information Catalog) API (free, no auth)",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "websiteUrl": "https://pipeworx.io/packs/nhtsa",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-nhtsa",
