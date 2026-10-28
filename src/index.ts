@@ -295,10 +295,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -670,15 +686,284 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
+
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
 /**
- * NHTSA MCP — wraps the NHTSA vPIC (Vehicle Product Information Catalog) API (free, no auth)
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
+/**
+ * NHTSA MCP — wraps the NHTSA vPIC (Vehicle Product Information Catalog) API (free, no auth),
+ * NHTSA's Fatality Analysis Reporting System (FARS) fatal-crash data, and
+ * fueleconomy.gov vehicle MPG (fleet #2972).
  *
  * Tools:
  * - decode_vin: decode a Vehicle Identification Number into make, model, year, and attributes
  * - get_makes: retrieve all vehicle makes registered with NHTSA
  * - get_models: retrieve all models for a given make and model year
+ * - get_recalls / get_complaints / get_safety_ratings: live NHTSA safety data
+ * - fars_state_fatalities / fars_vehicle_makes / fars_coverage: FARS fatal-crash
+ *   aggregates, loaded ahead of time into D1 (CrashAPI 403s on every probe; see
+ *   fars-store.ts and README.md "FARS data")
+ * - fuel_economy_mpg / fuel_economy_models: live fueleconomy.gov MPG lookups
  */
 
+import {
+  allStatesForYear,
+  FARS_SOURCE,
+  getFarsMeta,
+  listMakes,
+  lookupState,
+  requireFarsDb,
+  resolveState,
+  stateMonths,
+  vehicleMakesForYear,
+  vehicleMakeYears,
+  type D1Like,
+} from './fars-store.js';
+import { FE_SOURCE, menuModels, menuOptions, vehicleById } from './fuel-economy.js';
 
 // Bound every fetch() in this pack to a fixed timeout — an upstream that
 // degrades without erroring would otherwise hold the Worker in `await fetch()`
@@ -769,6 +1054,69 @@ const tools: McpToolExport['tools'] = [
       required: ['make', 'model', 'model_year'],
     },
   },
+  {
+    name: 'fars_state_fatalities',
+    description:
+      'Fatal motor-vehicle crash counts and fatalities for a US state, from NHTSA\'s Fatality Analysis Reporting System (FARS). Pass a state (full name like "Texas", 2-letter postal code like "TX", or FIPS code) and a year. Returns monthly rows: crashes, fatalities, persons involved, vehicles involved, pedestrians involved. Omit year to get every loaded year/month for that state. Covers a recent multi-year window (see data_as_of and call fars_coverage for the exact range), not full FARS history. Unknown states are refused with a clear error, never an empty success.',
+    summary: 'Monthly fatal-crash counts and fatalities for one US state.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        state: { type: 'string', description: 'State name ("Texas"), 2-letter postal code ("TX"), or FIPS code ("48").' },
+        year: { type: 'number', description: 'Optional: calendar year, e.g. 2023. Omit to return every loaded year for this state.' },
+      },
+      required: ['state'],
+    },
+  },
+  {
+    name: 'fars_vehicle_makes',
+    description:
+      'Vehicle makes involved in fatal crashes nationwide for a given year, from NHTSA FARS. Pass year alone to get the top makes ranked by vehicle-involvement count (e.g. "which vehicle makes show up most in fatal crashes in 2023"); pass make as well to get that one make\'s involvement count across every loaded year. This is an INVOLVEMENT count, not a claim that the make caused the crash. Unknown makes are refused with a clear error naming a few valid makes, never an empty success.',
+    summary: 'Vehicle makes involved in fatal crashes, ranked or looked up by name.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        year: { type: 'number', description: 'Calendar year, e.g. 2023. Required unless make is given (then optional, scoping to one year).' },
+        make: { type: 'string', description: 'Optional: vehicle make, e.g. "Toyota", "Ford", "Harley-Davidson".' },
+        limit: { type: 'number', description: 'Max makes to return when ranking by year. Default 20, max 50.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'fars_coverage',
+    description: 'What FARS fatal-crash data this pack actually has loaded right now: the earliest and latest year covered and when it was last loaded. Call this before fars_state_fatalities/fars_vehicle_makes if unsure a given year is covered.',
+    summary: 'Earliest/latest FARS year loaded, and when.',
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'fuel_economy_mpg',
+    description:
+      'EPA fuel-economy ratings (city/highway/combined MPG, CO2 g/mile, fuel type) for a specific model year + make + model, from fueleconomy.gov (DOE/EPA), proxied live. Pass the model string exactly as fueleconomy.gov lists it (e.g. "Camry", "F-150 2WD", "Model 3") -- if unsure, call fuel_economy_models first to see valid model strings for that year+make. A model year/make/model can have several engine/transmission/drivetrain VARIANTS; this returns up to 5, each with its own MPG. Unknown make/model/year combos are refused with a clear error (never an empty success) and, when the make or model itself is not recognized for that year, list a few valid options.',
+    summary: 'EPA city/highway/combined MPG and CO2 for a model year + make + model.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        year: { type: 'number', description: 'Model year, e.g. 2024.' },
+        make: { type: 'string', description: 'Vehicle make, e.g. "Toyota".' },
+        model: { type: 'string', description: 'Vehicle model exactly as fueleconomy.gov lists it, e.g. "Camry". Call fuel_economy_models to see valid strings.' },
+      },
+      required: ['year', 'make', 'model'],
+    },
+  },
+  {
+    name: 'fuel_economy_models',
+    description: 'List the exact model strings fueleconomy.gov recognizes for a given model year + make (e.g. year 2024, make "Toyota" -> "Camry", "Camry Hybrid LE", "RAV4 AWD", ...). Call this before fuel_economy_mpg when you are not sure of the exact model string, or when fuel_economy_mpg refuses a model as unrecognized.',
+    summary: 'Valid fueleconomy.gov model strings for a model year + make.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        year: { type: 'number', description: 'Model year, e.g. 2024.' },
+        make: { type: 'string', description: 'Vehicle make, e.g. "Toyota".' },
+      },
+      required: ['year', 'make'],
+    },
+  },
 ];
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
@@ -785,9 +1133,230 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return getComplaints(args.make as string, args.model as string, args.model_year as number);
     case 'get_safety_ratings':
       return getSafetyRatings(args.make as string, args.model as string, args.model_year as number);
+    case 'fars_state_fatalities':
+      return farsStateFatalities(requireFarsDb(args._d1), args);
+    case 'fars_vehicle_makes':
+      return farsVehicleMakes(requireFarsDb(args._d1), args);
+    case 'fars_coverage':
+      return farsCoverage(requireFarsDb(args._d1));
+    case 'fuel_economy_mpg':
+      return fuelEconomyMpg(args);
+    case 'fuel_economy_models':
+      return fuelEconomyModels(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
+}
+
+// ── FARS fatal-crash tools (D1, loaded ahead of time) ──────────────────────
+
+async function farsStateFatalities(db: D1Like, args: Record<string, unknown>) {
+  const meta = await getFarsMeta(db);
+  const resolved = resolveState(args.state);
+  if (!resolved) {
+    return { found: false, reason: 'invalid_state', message: `${JSON.stringify(args.state)} is not a recognizable state (give a full name, 2-letter postal code, or FIPS code).`, data_as_of: meta.latest_year };
+  }
+  const match = await lookupState(db, resolved);
+  if (!match) {
+    return {
+      found: false,
+      reason: 'unknown_state',
+      message: `${JSON.stringify(args.state)} is not a recognized US state in this pack's loaded FARS data. Use a full state name ("Texas"), 2-letter postal code ("TX"), or FIPS code.`,
+      data_as_of: meta.latest_year,
+    };
+  }
+  const year = args.year != null && args.year !== '' ? Math.floor(Number(args.year)) : null;
+  if (args.year != null && args.year !== '' && !Number.isFinite(year)) {
+    return { found: false, reason: 'invalid_year', message: `year must be a valid number (got ${JSON.stringify(args.year)}).`, data_as_of: meta.latest_year };
+  }
+  const rows = await stateMonths(db, match.state_fips, year);
+  if (!rows.length) {
+    return {
+      found: false,
+      reason: 'no_data',
+      state: match.state_name,
+      year,
+      message: `No FARS data for ${match.state_name}${year ? ` in ${year}` : ''} in the loaded window (${meta.earliest_year}-${meta.latest_year}).`,
+      coverage: { earliest_year: meta.earliest_year, latest_year: meta.latest_year },
+      ...FARS_SOURCE,
+      data_as_of: meta.latest_year,
+    };
+  }
+  const totalFatalities = rows.reduce((s, r) => s + r.fatalities, 0);
+  const totalCrashes = rows.reduce((s, r) => s + r.crashes, 0);
+  return {
+    found: true,
+    state: match.state_name,
+    state_fips: match.state_fips,
+    year,
+    total_crashes: totalCrashes,
+    total_fatalities: totalFatalities,
+    returned_months: rows.length,
+    coverage: { earliest_year: meta.earliest_year, latest_year: meta.latest_year },
+    months: rows,
+    ...FARS_SOURCE,
+    data_as_of: year ?? meta.latest_year,
+  };
+}
+
+async function farsVehicleMakes(db: D1Like, args: Record<string, unknown>) {
+  const meta = await getFarsMeta(db);
+  const makeArg = args.make != null && args.make !== '' ? String(args.make).trim() : null;
+
+  if (makeArg) {
+    const rows = await vehicleMakeYears(db, makeArg);
+    const year = args.year != null && args.year !== '' ? Math.floor(Number(args.year)) : null;
+    const filtered = year != null ? rows.filter((r) => r.year === year) : rows;
+    if (!rows.length) {
+      const sample = await listMakes(db, 15);
+      return {
+        found: false,
+        reason: 'unknown_make',
+        message: `${JSON.stringify(args.make)} is not a recognized vehicle make in this pack's loaded FARS data. A few makes that ARE loaded: ${sample.join(', ')}.`,
+        data_as_of: meta.latest_year,
+      };
+    }
+    if (!filtered.length) {
+      return {
+        found: false,
+        reason: 'no_data',
+        make: makeArg,
+        year,
+        message: `${makeArg} is a recognized make, but has no data for year ${year} in the loaded window (${meta.earliest_year}-${meta.latest_year}).`,
+        coverage: { earliest_year: meta.earliest_year, latest_year: meta.latest_year },
+        ...FARS_SOURCE,
+        data_as_of: meta.latest_year,
+      };
+    }
+    return {
+      found: true,
+      make: filtered[0].make_name,
+      years: filtered,
+      coverage: { earliest_year: meta.earliest_year, latest_year: meta.latest_year },
+      ...FARS_SOURCE,
+      data_as_of: meta.latest_year,
+    };
+  }
+
+  const year = args.year != null && args.year !== '' ? Math.floor(Number(args.year)) : null;
+  if (year == null || !Number.isFinite(year)) {
+    return { found: false, reason: 'missing_year', message: 'Pass year to rank makes for a year, or make to look up one make across years.', data_as_of: meta.latest_year };
+  }
+  const limit = Math.min(Math.max(1, Math.floor(Number(args.limit) || 20)), 50);
+  const rows = await vehicleMakesForYear(db, year, limit);
+  if (!rows.length) {
+    return {
+      found: false,
+      reason: 'no_data',
+      year,
+      message: `No vehicle-make data for year ${year} in the loaded window (${meta.earliest_year}-${meta.latest_year}).`,
+      coverage: { earliest_year: meta.earliest_year, latest_year: meta.latest_year },
+      ...FARS_SOURCE,
+      data_as_of: meta.latest_year,
+    };
+  }
+  return {
+    found: true,
+    year,
+    returned: rows.length,
+    note: 'vehicles_involved counts vehicles of this make present in a fatal crash that year -- not a claim the make caused the crash or its fatalities.',
+    makes: rows,
+    coverage: { earliest_year: meta.earliest_year, latest_year: meta.latest_year },
+    ...FARS_SOURCE,
+    data_as_of: meta.latest_year,
+  };
+}
+
+async function farsCoverage(db: D1Like) {
+  const meta = await getFarsMeta(db);
+  return {
+    earliest_year: meta.earliest_year,
+    latest_year: meta.latest_year,
+    years_loaded: meta.years_loaded,
+    loaded_at: meta.loaded_at,
+    note: 'Scoped to a recent multi-year window, not full FARS history (1975-present). Re-run the loader with a wider --years to extend further back.',
+    ...FARS_SOURCE,
+    data_as_of: meta.latest_year,
+  };
+}
+
+// ── fueleconomy.gov tools (live proxy) ─────────────────────────────────────
+
+function reqFuelEconomyArgs(args: Record<string, unknown>) {
+  const year = Math.floor(Number(args.year));
+  const make = args.make != null ? String(args.make).trim() : '';
+  if (!Number.isFinite(year) || !make) {
+    throw new Error('year and make are both required (e.g. year:2024, make:"Toyota").');
+  }
+  return { year, make };
+}
+
+async function fuelEconomyModels(args: Record<string, unknown>) {
+  const { year, make } = reqFuelEconomyArgs(args);
+  const models = await menuModels(year, make);
+  if (!models.length) {
+    throw new Error(`fueleconomy.gov has no models listed for make ${JSON.stringify(make)} in model year ${year} -- the make may be misspelled, or not sold that year. Try get_makes (NHTSA vPIC) to check spelling, or a nearby year.`);
+  }
+  return {
+    found: true,
+    year,
+    make,
+    returned: models.length,
+    models: models.map((m) => m.text),
+    ...FE_SOURCE,
+    data_as_of: String(year),
+  };
+}
+
+async function fuelEconomyMpg(args: Record<string, unknown>) {
+  const { year, make } = reqFuelEconomyArgs(args);
+  const model = args.model != null ? String(args.model).trim() : '';
+  if (!model) throw new Error('model is required (e.g. model:"Camry"). Call fuel_economy_models to see valid strings for this year+make.');
+
+  const options = await menuOptions(year, make, model);
+  if (!options.length) {
+    // Distinguish "bad make" from "bad model" so the refusal is actionable.
+    const models = await menuModels(year, make);
+    if (!models.length) {
+      throw new Error(`fueleconomy.gov has no data for make ${JSON.stringify(make)} in model year ${year} -- the make may be misspelled or not sold that year.`);
+    }
+    const sample = models.slice(0, 15).map((m) => m.text);
+    throw new Error(
+      `fueleconomy.gov does not recognize model ${JSON.stringify(model)} for ${year} ${make}. Valid model strings for this year/make include: ${sample.join(', ')}${models.length > 15 ? ', ...' : ''}. Call fuel_economy_models for the full list.`,
+    );
+  }
+
+  const variants = await Promise.all(options.slice(0, 5).map((opt) => vehicleById(opt.value)));
+  if (!variants.length) {
+    // menuOptions returned items but every vehicleById call failed to parse --
+    // loud error, never a silent empty success (wave-1 lesson).
+    throw new Error(`fueleconomy.gov listed ${options.length} variant(s) for ${year} ${make} ${model} but none could be resolved to MPG data. Upstream may be degraded; retry.`);
+  }
+  return {
+    found: true,
+    year,
+    make,
+    model,
+    returned_variants: variants.length,
+    variants: variants.map((v) => ({
+      trim_id: v.id,
+      transmission: v.trany,
+      drive: v.drive,
+      cylinders: v.cylinders,
+      displacement_l: v.displ,
+      vehicle_class: v.vclass,
+      fuel_type: v.fuel_type,
+      fuel_type_secondary: v.fuel_type2,
+      city_mpg: v.city_mpg,
+      highway_mpg: v.highway_mpg,
+      combined_mpg: v.combined_mpg,
+      combined_mpge_phev: v.phev_combined_mpge,
+      co2_g_per_mile: v.co2_g_per_mile,
+      start_stop: v.start_stop,
+    })),
+    ...FE_SOURCE,
+    data_as_of: String(year),
+  };
 }
 
 function reqVehicle(make: string, model: string, year: number) {
