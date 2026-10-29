@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-nhtsa",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "NHTSA MCP — wraps the NHTSA vPIC (Vehicle Product Information Catalog) API (free, no auth), NHTSA's Fatality Analysis Reporting System (FARS) fatal-crash data, and fueleconomy.gov vehicle MPG (fleet #2972).",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-nhtsa": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "nhtsa"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-nhtsa.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/nhtsa",
   "pipeworx": {
-    "sourceHash": "v1-14bb9ef82ee44667f1660eb48a3483a7bd1242f9ff8d01450171f012220af4f8",
-    "sourceCommit": "774de7f685a75e02d0b828d24a7b94794102152c"
+    "mode": "gateway",
+    "slug": "nhtsa",
+    "gatewaySlug": "nhtsa",
+    "sourceHash": "v1-d5dd9bc3bc1ac213e3cbc0995a2c6c86368851a3002742dd99fa8434f90cf291",
+    "sourceCommit": "5c89d6abb778d45da5d92002eb251978622bedf9"
   }
 }
