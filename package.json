@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-nhtsa",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "NHTSA MCP — wraps the NHTSA vPIC (Vehicle Product Information Catalog) API (free, no auth), NHTSA's Fatality Analysis Reporting System (FARS) fatal-crash data, and fueleconomy.gov vehicle MPG (fleet #2972).",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "nhtsa",
     "gatewaySlug": "nhtsa",
-    "sourceHash": "v1-d5dd9bc3bc1ac213e3cbc0995a2c6c86368851a3002742dd99fa8434f90cf291",
-    "sourceCommit": "5c89d6abb778d45da5d92002eb251978622bedf9"
+    "sourceHash": "v1-a6efe9510ff330453a367f1d7611239bf55bf36cf6833c0adba299d951ebde2b",
+    "sourceCommit": "bed7faa04e7276899b5e3870ef11c98625371f2b"
   }
 }
